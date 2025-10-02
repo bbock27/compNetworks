@@ -12,6 +12,53 @@
 #include <netinet/tcp.h>
 #include <signal.h>
 
+
+int writeAll(int fd, char*buf, int bytesToWrite){
+  int bytesSent = 0;
+  while(bytesSent < bytesToWrite){
+    bytesSent += write(fd, buf+bytesSent, bytesToWrite-bytesSent);
+    if(bytesSent < 0){
+      if(errno == EINTR){
+        continue;
+      }
+      return -1;
+    }
+  }
+}
+
+//returns a fd corresponding to server connection
+int getServerInfo(struct ParsedRequest* req){
+  char* host = req->host;
+  char* port = req->port;
+
+  if(port == NULL){
+    port = "80";
+  }
+
+  struct addrinfo hints, *res;
+
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_flags = AI_PASSIVE;
+
+  if (getaddrinfo(host, port, &hints, &res) != 0) {
+      perror("getaddrinfo");
+      return -1;
+  }
+
+  int socketFd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+
+  if(connect(socketFd, res->ai_addr, res->ai_addrlen) != 0){
+    close(socketFd);
+    return -1;
+  }
+
+  freeaddrinfo(res);
+  return socketFd;
+
+}
+
 void sigchld_handler(int s)
 {
     (void)s; // quiet unused variable warning
@@ -26,7 +73,7 @@ void sigchld_handler(int s)
 
 int setUpConnection(char *proxy_port){
   struct addrinfo hints, *res;
-  int sfd;
+  int socketFd;
 
   memset(&hints, 0, sizeof(hints));
   hints.ai_family = AF_INET;
@@ -38,44 +85,46 @@ int setUpConnection(char *proxy_port){
       return -1;
   }
 
-  sfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-  if (sfd < 0) { perror("socket"); freeaddrinfo(res); return -1; }
+  socketFd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+  if (socketFd < 0) { perror("socket"); freeaddrinfo(res); return -1; }
 
   int yes = 1;
-  setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+  setsockopt(socketFd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
-  if (bind(sfd, res->ai_addr, res->ai_addrlen) < 0) {
+  if (bind(socketFd, res->ai_addr, res->ai_addrlen) < 0) {
       perror("bind");
-      close(sfd);
+      close(socketFd);
       freeaddrinfo(res);
       return -1;
   }
   int queueSize = 10;
-  if (listen(sfd, queueSize) < 0) {
+  if (listen(socketFd, queueSize) < 0) {
       perror("listen");
-      close(sfd);
+      close(socketFd);
       freeaddrinfo(res);
       return -1;
   }
 
   freeaddrinfo(res);
-  return sfd;
+  return socketFd;
 
 }
 
 
-// Read until \r\n\r\n or buffer full. Returns bytes read or -1
+// Read until \r\n or buffer full. Returns bytes read or -1
 int readReqLine(int fd, char *buf, size_t bufsz) {
   int off = 0;
   while (off + 1 < bufsz) {
     int r = read(fd, buf + off, 1);
-    if (r == 0) return off; // eof
+    if (r == 0) {
+      return off; // eof
+    }
     if (r < 0) {
       if (errno == EINTR) continue;
       return -1;
     }
     off += r;
-    if (off >= 4 && buf[off-4] == '\r' && buf[off-3] == '\n' && buf[off-2] == '\r' && buf[off-1] == '\n') {
+    if (off >= 2 && buf[off-2] == '\r' && buf[off-1] == '\n') {
       return off;
     }
   }
@@ -109,7 +158,7 @@ int checkReqLineValidity(char*buf, size_t bufSize){
     return 1;    
   }
 
-  if (bufSize >= 4 && buf[bufSize-4] == '\r' && buf[bufSize-3] == '\n' && buf[bufSize-2] == '\r' && buf[bufSize-1] == '\n') {
+  if (bufSize >= 2 && buf[bufSize-2] == '\r' && buf[bufSize-1] == '\n') {
     return 0;
   }
   else{
@@ -118,21 +167,48 @@ int checkReqLineValidity(char*buf, size_t bufSize){
 
 }
 
-int readHeaders(int fd, char *buf, size_t bufsz, int startPoint){
+int readHTTP(int fd, char *buf, size_t bufSize){
   int bytesRead = 0;
-  while (startPoint + bytesRead + 1 < bufsz) {
-    int r = read(fd, buf + startPoint + bytesRead, 1);
-    if (r == 0) {
+  int startPoint = 0;
+  while (startPoint + bytesRead + 1 < bufSize) {
+    bytesRead += read(fd, buf + startPoint + bytesRead, bufSize);
+    if (bytesRead == 0) {
       return bytesRead; // eof
     }
-    if (r < 0) {
+    if (bytesRead < 0) {
       if (errno == EINTR) continue;
       return -1;
     }
-    bytesRead += r;
+    if(bytesRead >= 2){
+      char one = buf[bytesRead-2];
+      char two = buf[bytesRead-1];
+    }
+    if (bytesRead >= 4 && buf[bytesRead-4] == '\r' && buf[bytesRead-3] == '\n' && buf[bytesRead-2] == '\r' && buf[bytesRead-1] == '\n') {
+      return bytesRead;
+    } 
     
   }
   return bytesRead; //buffer full
+}
+
+int sendStatus(int clientFd, char* message){
+  writeAll(clientFd, message, strlen(message));
+}
+
+
+int constructForwardMsg(struct ParsedRequest* request){
+  ParsedHeader_remove(request, "Connection");
+  ParsedHeader_set(request, "Connection", "close");
+
+  char* port = request->port;
+  if(port == NULL){
+    port = "80";
+  }
+
+
+
+
+
 }
 
 
@@ -153,31 +229,49 @@ int handle_client(int clientfd){
   struct ParsedRequest* request = ParsedRequest_create();
   int bufSize = 1024*16;
   char buf[bufSize+1];
-  readReqLine(clientfd, buf, bufSize);
+  // readReqLine(clientfd, buf, bufSize);
 
-  int bufLenUsed = strlen(buf);
+  // int bufLenUsed = strlen(buf);
 
-  int reqLineValidity = checkReqLineValidity(buf, bufLenUsed);
+  // int reqLineValidity = checkReqLineValidity(buf, bufLenUsed);
 
-  if(reqLineValidity == 1){
+    //at this point we have a properly formnatted req line
+  int bufLenUsed = readHTTP(clientfd, buf, bufSize);
+
+  if (ParsedRequest_parse(request, buf, bufLenUsed) < 0) {
+    sendStatus(clientfd, "HTTP/1.0 400 Bad Request\r\n\r\n");
+    printf("parse failed\n");
+    return -1;
+  }
+
+  int reqLineValidity = 0;
+
+  if(request->method != "GET"){
     //send not implemented response
+    sendStatus(clientfd, "HTTP/1.0 501 Not Implemented\r\n\r\n");
   }
   else if(reqLineValidity == 2){
     //send bad request error
   }
 
-  //at this point we have a properly formnatted req line
-  int response = readHeaders(clientfd, buf, bufSize, bufLenUsed);
 
 
-  if (ParsedRequest_parse(request, buf, bufLenUsed) < 0) {
-    printf("parse failed\n");
-    return -1;
-  }
+  int serverFd = getServerInfo(request);
+
+
+
+
+
+  
+
+
+
 
   
 
   printf("yay!%s", buf);
+
+  return 0;
 }
 
 /* TODO: proxy()
@@ -226,21 +320,26 @@ int proxy(char *proxy_port) {
       break;
     }
 
-    pid_t pid = fork();
+    // pid_t pid = fork();
+    pid_t pid = 0;
     if (pid < 0) {
       perror("fork");
       close(clientfd);
       continue;
     } else if (pid == 0) {
       //child process
+      printf("in child");
       close(listenFd); //dont need bc we're in child so not listening for any new connections
       handle_client(clientfd);
       return 0;
     } else {
       //parent process
+      printf("in parent");
       close(clientfd);
     }
   }
+
+  return 0;
 
   
 }
